@@ -18,6 +18,7 @@
 #include "model.hh"
 #include "simulate.hh"
 #include "PMCMC.hh"
+#include "gitversion.hh"
 
 using namespace std;
 
@@ -25,6 +26,8 @@ void init();
 
 int main(int argc, char** argv)
 {
+	cout << "CoronaPMCMC version " << GIT_VERSION << endl;
+
 	switch(argc){
 	case 3:   // Simulation mode
 		siminf = 1;
