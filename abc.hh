@@ -1,59 +1,39 @@
 #ifndef BEEPMBP__ABC_HH
 #define BEEPMBP__ABC_HH
 
-#include "data.hh"
-#include "model.hh"
-
-struct PARAMSAMP;
-class DATA;
-class MODEL;
-class POPTREE;
-class Output;
-class Obsmodel;
-class Chain;
-struct SAMPLE;
+#include "struct.hh"
+#include "state.hh"
+#include "output.hh"
+#include "details.hh"
 
 class ABC
 {
 public:	
-  ABC(const Details &details, DATA &data, MODEL &model, const POPTREE &poptree, const Mpi &mpi, Inputs &inputs, Output &output, Obsmodel &obsmodel);	
-	void smc();
-	void mbp();
-	
-private:
-	double mcmc_updates(Generation &gen, vector <Particle> &part, Chain &chain, double &jump);
-	void cholesky(const vector <vector <double> > &param_samp);
-	void cholesky_propose(vector <double> &paramval, double fac);
-	double mix(const vector <Particle> &part, unsigned int *partcopy) const;
-	vector <double> variance_vector(const vector <vector <double> > &param_samp) const;
-	vector <vector <double> > covariance_matrix(const vector <vector <double> > &param_samp) const;
-	double mvn_prob(const vector<double> &pend, const vector<double> &pstart, double fac) const;
-	void exchange_samples_mpi(Generation &gen);
-	double next_generation_mpi(vector<Particle> &part, unsigned int *partcopy);
-	void results_mpi(const vector <Generation> &generation, const vector <Particle> &part, Chain &chain) const;
-	SAMPLE get_sample(const Particle &part, Chain &chain) const;
-	double acceptance(double rate) const;
-	void calculate_w(vector <Generation> &generation, double jump);
-	unsigned int Neff(vector <double> w);
-	
-	vector <vector <double> > invert_matrix(const vector <vector <double> > &mat) const;
+  ABC(const Details &details, const Data &data, const Model &model, const Inputs &inputs, const Output &output, const ObservationModel &obsmodel, Mpi &mpi);	
+	void run();
 
-	unsigned int total_time;                 // The time the algorithm is run for
-		
-	unsigned int nvar;                       // The number of variables which can change
-	vector <unsigned int> param_not_fixed;   // A list of all parameters which actualy change 
+private:
+	void implement_cutoff_frac();
+	bool terminate() const;
+	void diagnostic() const;
+
+	double cutoff;                           // Sets the cut-off used in the rejection sampling
+
+	double cutoff_frac;                      // Sets the acceptance fraction
 	
-	vector < vector <double> > Zchol;        // The matrix for Cholesky decompostion
-	vector < vector <double> > M; 
-	vector < vector <double> > inv; 
-		
+	unsigned int Ntot;                       // Sets the total number of samples that need to be generated
+	
+	vector <Particle> particle_store;        // Stores the states
+
+	unsigned int percentage;                 // Stores the percentage progress
+	
+	State state;                             // Stores the state of the system
+	
 	const Details &details;
-	DATA &data;
-	MODEL &model;
-	const POPTREE &poptree;
-	const Mpi &mpi;
-	Output &output;
-	Obsmodel &obsmodel;
+	const Model &model;
+	const Output &output;
+	const ObservationModel &obsmodel;
+	Mpi &mpi;
 };
 
 #endif

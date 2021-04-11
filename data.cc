@@ -6,113 +6,59 @@
 #include <sstream>
 #include <algorithm>
 #include <math.h> 
+#include <iomanip>
 
 using namespace std;
 
-#include "utils.hh"
 #include "data.hh"	
-#include "consts.hh"
-#include "pack.hh"
-#include "generateQ.hh"
-#include "output.hh"
-#include "details.hh"
 #include "inputs.hh"
+#include "mpi.hh"
 
-#ifdef USE_DATA_PIPELINE
+const string filter = "";                                       // Used to filter certain regions
+//const string filter = "northing50";                                       // Used to filter certain regions
+//const string filter = "scotland";  
+//const string filter = "notscotland";
+//const string filter = "england";  
+
+#ifdef USE_Data_PIPELINE
 #include "datapipeline.hh"
 #include "table.hh"
 #endif
 
 /// Initialises data
-DATA::DATA(const Inputs &inputs, const Details &details, const Mpi &mpi, DataPipeline *dp) :
-	datapipeline(dp), datadir(inputs.find_string("datadir","UNSET")),
-	compX(area), compY(area), details(details)
+Data::Data(const Inputs &inputs, const Details &details, Mpi &mpi, DataPipeline *dp) :
+	datapipeline(dp), data_directory(inputs.find_string("datadir","UNSET")), details(details)
 {
 	// The data directory
-	if(datadir == "UNSET") emsgroot("The 'datadir' must be set.");
+	if(data_directory == "UNSET") emsgroot("The 'data_directory' must be set.");
 
-	threshold = inputs.find_int("threshold",UNSET);                                       // The threshold (if specified)
-	if(threshold != UNSET) thres_h = log(1.0/(threshold + 0.5*sqrt(2*M_PI*minvar)));
-	else thres_h = UNSET;
+	threshold = inputs.find_integer("threshold",UNSET);                                       // The threshold (if specified)
 	
-	democat = inputs.find_democat(details);
+	democat = inputs.find_demographic_category();
 	ndemocat = democat.size();	
 	nage = democat[0].value.size();
 	calc_democatpos();
 
-	covar = inputs.find_covar(details);
+	covar = inputs.find_covariate();
 	ncovar = covar.size();
 	
-	timeperiod = inputs.find_timeperiod(details);
-	
-	inputs.find_genQ(genQ,details);
-	inputs.find_Q(Q,timeperiod,details);
+	inputs.find_genQ(genQ,details,democat[0].value);
 	
 	read_data_files(inputs,mpi);                                  // Reads the data files
 }
 
-/// Outputs properties of data to the terminal
-void DATA::print_to_terminal() const
-{
-	if(covar.size() > 0){
-		cout << "Area covariates: " << endl;
-		cout << "  ";
-		for(unsigned int j = 0; j < covar.size(); j++) cout << covar[j].name << "   param='" << covar[j].param << "'" << endl; 
-		cout << endl;
-	}	
-	
-	cout << "Age categories: " << endl << "  ";
-	for(unsigned int j = 0; j < democat[0].value.size(); j++){
-		if(j != 0) cout << ", ";
-		cout << democat[0].value[j] << " sus='" << democat[0].param[j] << "'";
-	}
-	cout << endl << endl;
 
-	if(democat.size() > 1){
-		cout << "Demographic categories: " << endl;
-		for(unsigned int k = 1; k < democat.size(); k++){
-			cout << "  ";
-			for(unsigned int j = 0; j < democat[k].value.size(); j++){
-				if(j != 0) cout << ", ";
-				cout << democat[k].value[j] << " sus='" <<  democat[k].param[j] << "'";
-			}	
-			cout << endl;
-		}
-		cout << endl;
-	}
-	
-	cout << "Time periods defined:" << endl;
-	for(unsigned int j = 0; j < timeperiod.size(); j++){
-		cout << "  ";
-		cout << timeperiod[j].name << ": ";
-		if(j == 0) cout << "0"; else cout << timeperiod[j-1].tend;
-		cout << " - " <<  timeperiod[j].tend << endl;
-	}
-	cout << endl;
-	
-	cout << "Q tensors loaded:" << endl;
-	for(unsigned int j = 0; j < Q.size(); j++){
-		cout << "    ";
-		cout << "timep: " << timeperiod[Q[j].timep].name << "  ";
-		cout << "compartment: " << Q[j].comp << "  ";
-		cout << "name: " << Q[j].name << "  ";
-		cout << endl;
-	}
-	cout << endl;
-}
-
-/// Based to the different demographic categories, this calculates all the possible compinations
-void DATA::calc_democatpos()
+/// Based on the different demographic categories, this calculates all the possible combinations
+void Data::calc_democatpos()
 {
-	vector <unsigned int> count;
+	vector <unsigned int> count(ndemocat);                        // Defines all the demographic states
+	for(auto& co : count) co = 0;
 	
-	count.resize(ndemocat);                                     // Defines all the demographic states
-	for(int dc = 0; dc < int(ndemocat); dc++) count[dc] = 0;
-	
-	int fl, dc;
+	int dc;
 	do{
 		democatpos.push_back(count);
 		
+		auto fl=0u;
 		dc = ndemocat-1;
 		do{
 			fl = 0;
@@ -120,311 +66,951 @@ void DATA::calc_democatpos()
 		}while(fl == 1 && dc >= 0);
 	}while(dc >= 0);
 	ndemocatpos = democatpos.size();
+
 	ndemocatposperage = ndemocatpos/nage;
 }
 
-/// Loads the region data file
-void DATA::load_region_file(const Inputs &inputs)
-{
-	string file = inputs.find_string("regions","UNSET");
-	if(file == "UNSET") emsgroot("A 'regions' file must be specified");
-	
-	TABLE tab = loadtable(file);
-	
-	unsigned int namecol = findcol(tab,"name");
-	unsigned int codecol = findcol(tab,"code");
-	
-	for(unsigned int row = 0; row < tab.nrow; row++){
-		REGION reg;
-		reg.name = tab.ele[row][namecol];
-		reg.code = tab.ele[row][codecol];
-		region.push_back(reg);
-	}		
-	nregion = region.size();
-}
 
 /// Reads in transition and area data
-void DATA::read_data_files(const Inputs &inputs, const Mpi &mpi)
+void Data::read_data_files(const Inputs &inputs, Mpi &mpi)
 {
-	unsigned int r, i, c, imax, k, td, pd, md, j, jmax, d, dp, a, q, row;
-	unsigned int codecol, xcol, ycol, regcol;
-	double v=0, sum;
-	string line, ele, name, regcode, st, file;
-	REGION reg;
-	AREA are;
-	DEMOCAT dem;
-	IND indi;
-	
-	vector <vector <double> > val;
-	vector <double> vec;
-	vector <unsigned int> rcol;
-	
-	transdata = inputs.find_transdata(details);	                                          // Loads data
-	
-	popdata = inputs.find_popdata(details);	                                       
-	
-	margdata = inputs.find_margdata(details,democat);	 
-
-	if(transdata.size() == 0 && popdata.size() == 0)  emsgroot("'transdata' and/or 'popdata' must be set.");	
+	datatable = inputs.find_datatable(details);
+	if(datatable.size() == 0) emsgroot("'datatables' must be set.");	
 
 	if(mpi.core == 0){
-		load_region_file(inputs);
-	
+		check_datatable();
+
 		string file = inputs.find_string("areas","UNSET");
 		if(file == "UNSET") emsgroot("A 'areas' file must be specified");
-		TABLE tab = loadtable(file);
-		
-		// If onle one age group then combines all columns with "age" to generate an "all" column
-		if(nage == 1){
-			vector <unsigned int> agecols;
-			for(unsigned int col = 0; col < tab.heading.size(); col++){
-				if(tab.heading[col].length() > 3){
-					if(tab.heading[col].substr(0,3) == "age") agecols.push_back(col);
-				}
-			}
-			table_createcol("all",agecols,tab);
-		}
-		
-		codecol = findcol(tab,"area");                                                 // Works out ccolumns for different columns
-		xcol = findcol(tab,"easting");
-		ycol = findcol(tab,"northing");
-		regcol = findcol(tab,"region");
-		
-		for(j = 0; j < ncovar; j++) covar[j].col = findcol(tab,covar[j].name);
-
-		for(j = 0; j < ndemocat; j++){
-			democat[j].col.resize(democat[j].value.size());
-			for(k = 0; k < democat[j].col.size(); k++) democat[j].col[k] = findcol(tab,democat[j].value[k]);  
-		}
-
-		for(row = 0; row < tab.nrow; row++){
-			are.code = tab.ele[row][codecol];
-			are.x = atof(tab.ele[row][xcol].c_str());
-			are.y = atof(tab.ele[row][ycol].c_str());
+			
+		Table tab = load_table(file);
 	
-			regcode = tab.ele[row][regcol];
-			r = 0; while(r < nregion && region[r].code != regcode) r++;
-			if(r == nregion) emsg("In file '"+file+"' the region code '"+regcode+"' is not recognised.");
-			are.region = r;
-					
-			are.covar.resize(ncovar);
-			for(j = 0; j < ncovar; j++){
-				st = tab.ele[row][covar[j].col];
-				v = atof(st.c_str());
-				if(std::isnan(are.covar[j])) emsg("In file '"+file+"' the expression '"+st+"' is not a number");	
-			
-				if(covar[j].func == "log"){
-					if(v == 0) v = 0.01;
-					if(v <= 0) emsg("In file '"+file+"' the log transformed quantities from 'covar' must be positive.");
-					are.covar[j] = log(v);
-				}
-				else{
-					if(covar[j].func == "linear") are.covar[j] = v;
-					else emsg("n file '"+file+"' the functional relationship '"+covar[j].func+"' is not recognised.");
-				}
-			}
-			
-			val.resize(democat.size());
-			for(d = 0; d < democat.size(); d++){
-				jmax = democat[d].value.size();
-				val[d].resize(jmax);
-				for(j = 0; j < jmax; j++){
-					st = tab.ele[row][democat[d].col[j]];
-					val[d][j] = atof(st.c_str());
-					if(std::isnan(val[d][j])) emsg("In file '"+file+"' the expression '"+st+"' is not a number");	
-				}
-			}
-			
-			are.agepop.resize(nage);
-			for(a = 0; a < nage; a++){
-				are.agepop[a] = val[0][a];
-			}
-				
-			are.pop.resize(ndemocatpos);
-			for(dp = 0; dp < ndemocatpos; dp++){
-				for(j = 0; j < democat.size(); j++){
-					if(j == 0) v = val[j][democatpos[dp][j]];
-					else v *= val[j][democatpos[dp][j]]/100.0;
-				}
-				are.pop[dp] = (unsigned int)(v+0.5);
-			}
+		read_areas(tab,file);
+		
+		load_region_effect(inputs,tab);
 
-			area.push_back(are);			
-		}
-		narea = area.size();
-		
-		if(false){  // Averages covariates across regions
-			vector <double> av, nav;
-			av.resize(region.size()); nav.resize(region.size());
-			for(j = 0; j < ncovar; j++){  
-				for(r = 0; r < region.size(); r++){ av[r] = 0; nav[r] = 0;}
-				
-				for(c = 0; c < narea; c++){
-					r = area[c].region;
-					if(covar[j].func == "log") av[r] += exp(area[c].covar[j]);
-					else av[r] += area[c].covar[j];
-					nav[r]++;
-				}
-				
-				for(c = 0; c < narea; c++){
-					r = area[c].region;
-					if(covar[j].func == "log") area[c].covar[j] = log(av[r]/nav[r]);
-					else area[c].covar[j] = av[r]/nav[r];
-				}
-				
-				for(r = 0; r < region.size(); r++) cout << region[r].name << " " << av[r]/nav[r] << " average density" << endl;
-			}
-		}
-		
-		for(j = 0; j < ncovar; j++){            // Shifts covariates so average is zero
-			sum = 0; for(c = 0; c < narea; c++) sum += area[c].covar[j];
-			sum /= narea;
-			
-			for(c = 0; c < narea; c++) area[c].covar[j] -= sum;
-		}		
-		
-		if(checkon == 1){
-			for(c = 0; c < narea; c++){
-				cout << nregion << " " << area[c].region << "region" << endl;
-				cout << area[c].code << " " << region[area[c].region].code << " " <<  area[c].x << " " <<  area[c].y << "  ***";
-			
-				for(j = 0; j < area[c].pop.size(); j++) cout << area[c].pop[j] << ", ";
-				cout << endl;	
-			}
-		}
-		
-		//convertOAtoM(); emsg("done");
-		//convertRegion_M(); emsg("done");
-
-		if(details.mode != sim && details.mode != multisim){                                                    // Loads transition data for inference
-			for(td = 0; td < transdata.size(); td++){
-				file = transdata[td].file; 
-				TABLE tab = loadtable(file);
-				table_selectdates(transdata[td].start,transdata[td].units,tab,"trans");
-				
-				rcol.clear();
-				if(transdata[td].type == "reg"){	for(k = 0; k < region.size(); k++) rcol.push_back(findcol(tab,region[k].code));}
-				else{ rcol.push_back(findcol(tab,"all"));}
-				
-				transdata[td].num.resize(rcol.size());
-				for(r = 0; r < rcol.size(); r++){
-					
-					transdata[td].num[r].resize(tab.nrow);
-					for(row = 0; row < tab.nrow; row++){	
-						transdata[td].num[r][row] = getint(tab.ele[row][rcol[r]],file);
-					}
-				}
-				transdata[td].rows = tab.nrow;
-				if(transdata[td].start + (tab.nrow-1)*transdata[td].units > details.period){
-					emsg("The file '"+file+"' has more data than will fit in the defined 'start' and 'end' time period.");
-				}
-			}
-		}
-		
-		if(details.mode != sim && details.mode != multisim){                                                    // Loads population data for inference
-			for(pd = 0; pd < popdata.size(); pd++){
-				file = popdata[pd].file;
-				TABLE tab = loadtable(file);
-				table_selectdates(popdata[pd].start,popdata[pd].units,tab,"pop");
-			
-				rcol.clear();
-				if(popdata[pd].type == "reg"){	for(k = 0; k < region.size(); k++) rcol.push_back(findcol(tab,region[k].code));}
-				else{ rcol.push_back(findcol(tab,"all"));}
-				
-				popdata[pd].num.resize(rcol.size());
-				for(r = 0; r < rcol.size(); r++){
-					popdata[pd].num[r].resize(tab.nrow);
-					for(row = 0; row < tab.nrow; row++) popdata[pd].num[r][row] = getint(tab.ele[row][rcol[r]],file);
-				}
-				popdata[pd].rows = tab.nrow;
-				
-				if(popdata[pd].start + (tab.nrow-1)*popdata[pd].units > details.period){
-					emsg("The file '"+file+"' has more data than will fit in the defined 'start' and 'end' time period.");
-				}
-			}
-		}
-		
-		if(details.mode != sim && details.mode != multisim){                                                    // Loads marginal data for inference
-			for(md = 0; md < margdata.size(); md++){
-				file = margdata[md].file;
-				TABLE tab = loadtable(file);
+		load_datatable(tab);	
 	
-				rcol.clear();
-				if(margdata[md].type == "reg"){	for(k = 0; k < region.size(); k++) rcol.push_back(findcol(tab,region[k].code));}
-				else{ rcol.push_back(findcol(tab,"all"));}
-				
-				margdata[md].percent.resize(rcol.size());
-				for(r = 0; r < rcol.size(); r++){
-					margdata[md].percent[r].resize(tab.nrow);
-					for(row = 0; row < tab.nrow; row++){	
-						margdata[md].percent[r][row] = atof(tab.ele[row][rcol[r]].c_str());
-					}
-				}
-			}
-		}
+		load_counterfactual(inputs,tab);
 		
-		generateQ(nage,datadir,genQ,area,datapipeline);
+		generate_matrices();
+		
+		coarse_grain(tab,inputs.find_string("geography","UNSET"));
 	}
+	if(mpi.ncore > 1) mpi.copy_data(narea,area,region_effect,nobs,obs,genQ,counterfact);
 
-	if(mpi.ncore > 1) copydata(mpi.core);
-	
-	vec.resize(nage);                                                 // Reads in Q tensors
-	for(q = 0; q < Q.size(); q++){
-		j = 0; while(j < genQ.Qten.size() && genQ.Qten[j].name != Q[q].name) j++;
-		if(j == genQ.Qten.size()) emsg("Cannot find the reference to '"+Q[q].name+"' in the input TOML file.");
-		Q[q].Qtenref = j;
+	if(details.siminf == INFERENCE) set_datatable_weights();
+
+	agedist.resize(nage); for(auto& aged : agedist) aged = 0;
+	democatpos_dist.resize(ndemocatpos); for(auto& dpd : democatpos_dist) dpd = 0;
+	democat_dist.resize(ndemocat); 
+	for(auto d = 0u; d < ndemocat; d++){
+		democat_dist[d].resize(democat[d].value.size()); for(auto& dvd : democat_dist[d]) dvd = 0;
 	}
 		
-	agedist.resize(nage); for(a = 0; a < nage; a++) agedist[a] = 0;
-	
-	for(c = 0; c < narea; c++){                                              // Adds individuals to the system
+	popsize = 0;
+	for(auto c = 0u; c < narea; c++){                                    // Adds individuals to the system
 		area[c].ind.resize(ndemocatpos);
-		for(dp = 0; dp < ndemocatpos; dp++){
-			imax = area[c].pop[dp];
-			for(i = 0; i < imax; i++){
-				area[c].ind[dp].push_back(ind.size());
+		for(auto dp = 0u; dp < ndemocatpos; dp++){
+			auto imax = area[c].pop[dp];
+			if(modeltype == IND_MODEL){
+				for(auto i = 0u; i < imax; i++){
+					area[c].ind[dp].push_back(ind.size());
 				
-				indi.area = c;
-				indi.dp = dp;
-				ind.push_back(indi);
+					Individual indi;
+					indi.area = c;
+					indi.dp = dp;
+					ind.push_back(indi);
+				}
 			}
-			a = democatpos[dp][0];
+			democatpos_dist[dp] += imax;
+			
+			auto a = democatpos[dp][0];
 			agedist[a] += imax;
+			
+			for(auto d = 0u; d < ndemocat; d++){
+				democat_dist[d][democatpos[dp][d]] += imax; 
+			}
+			
+			popsize += imax;
 		}
 	}
-	popsize = ind.size();
-	for(a = 0; a < nage; a++) agedist[a] /= popsize;
 	
-	narage = narea*nage;                                              // Generates the mixing matrix between ages/areas
+	if(false){
+		for(auto& aged : agedist) cout << aged << "\n"; cout << "agedist\n"; emsg("O");
+	}
+	
+	for(auto& aged : agedist) aged /= popsize;
+	for(auto& dpd : democatpos_dist) dpd /= popsize;
+	for(auto d = 0u; d < ndemocat; d++){
+		for(auto& dvd : democat_dist[d]) dvd /= popsize;
+	}
+	
+	if(false){
+		for(auto d = 0u; d < ndemocat; d++){
+			for(auto i = 0u; i < democat_dist[d].size(); i++) cout << d << " " << i << " " << democat_dist[d][i] << ",\n";
+		}
+		
+		for(auto a = 0u; a < agedist.size(); a++) cout << agedist[a] << ","; cout << "h\n";
+		emsg("P");	
+	}
+	
+	narage = narea*nage;
 	nardp = narea*ndemocatpos; 
-	nsettardp = details.nsettime*nardp;
+	nsettardp = details.ndivision*nardp;
 	
-	//plotrawdata(); emsg("done");
-	//generatedeathdata(); emsg("done");
+	raw();  // Does raw data analysis
 }
 
+
+/// Checks for any errors in the definition of the datatables
+void Data::check_datatable()
+{
+	if(details.mode == SIM){ // If siulting checks that all the file names are different
+		for(auto dt = 0u; dt < datatable.size(); dt++){
+			for(auto dt2 = 0u; dt2 < dt; dt2++){
+				if(datatable[dt].file == datatable[dt2].file){
+					stringstream ss; ss << "The file name '" << datatable[dt].file << "' is used more than once.";
+					emsg(ss.str());
+				}				
+			}
+		}
+	}		
+}		
+
+
+/// Reads the file which gives information about areas
+void Data::read_areas(Table &tab, string file)
+{
+	// If only one age group then combines all columns with "age" to generate an "all" column
+	
+	age_from.resize(nage); age_to.resize(nage);
+	for(auto a = 0u; a < nage; a++){
+		string name = democat[0].value[a];
+		
+		auto col = 0u; while(col < tab.ncol && tab.heading[col] != name) col++;
+
+		if(col == tab.ncol){		
+			if(name == "all"){ age_from[a] = 0; age_to[a] = 100;} 
+			else{
+				auto len = name.length();
+				if(name.substr(len-1,1)== "+"){ age_from[a] = atoi(name.substr(0,len-1).c_str()); age_to[a] = 100;} 
+				else{
+					auto st = split(name,'-');
+					if(st.size() != 2) emsg("Age problem");
+					age_from[a] = atoi(st[0].c_str());
+					age_to[a] = atoi(st[1].c_str());
+				}
+			}
+			table_add_age(name,age_from[a],age_to[a],tab);
+		}
+	}
+	
+	if(false){ // Multiplies all the populations by a factor
+		auto fac = 13u;
+		for(auto a = 0u; a < nage; a++){
+			auto col = find_column(tab,democat[0].value[a]);
+			for(auto row = 0u; row < tab.nrow; row++){
+				stringstream ss; ss << atoi(tab.ele[row][col].c_str())*fac;
+				tab.ele[row][col] = ss.str();
+			}
+		}
+	}
+	
+	auto codecol = find_column(tab,"area");            // Works out columns for different quantities
+	//auto xcol = find_column(tab,"easting");
+	//auto ycol = find_column(tab,"northing");
+	
+	vector <unsigned int> cov_col(ncovar); 
+	for(auto cov = 0u; cov < ncovar; cov++) cov_col[cov] = find_column(tab,covar[cov].name);
+
+	vector < vector <unsigned int> > democat_col(ndemocat); 
+	for(auto democ = 0u; democ < ndemocat; democ++){
+		democat_col[democ].resize(democat[democ].value.size());
+		for(auto k = 0u; k < democat[democ].value.size(); k++){
+			democat_col[democ][k] = find_column(tab,democat[democ].value[k]);  
+		}
+	}
+
+	filter_areas(tab);
+	
+	for(const auto& trow : tab.ele){
+		Area are;
+		are.code = trow[codecol];
+		
+		are.x = ran();
+		//if(trow[xcol] == "NA") emsg("Easting");
+		//else are.x = atof(trow[xcol].c_str());
+		//if(std::isnan(are.x)) emsg("Problem with eastings");
+		
+		are.y = ran();
+		//if(trow[ycol] == "NA") emsg("Northing");
+		//else are.y = atof(trow[ycol].c_str());
+		//if(std::isnan(are.y)) emsg("Problem with northings");
+		
+		are.region_effect = UNSET;
+			
+		are.covar.resize(ncovar);
+		for(auto j = 0u; j < ncovar; j++){
+			auto st = trow[cov_col[j]];
+			auto v = atof(st.c_str());
+			if(std::isnan(are.covar[j])) emsg("In file '"+file+"' the expression '"+st+"' is not a number");	
+		
+			if(covar[j].func == "log"){
+				if(v == 0) v = 0.01;
+				if(v <= 0) emsg("In file '"+file+"' the log transformed quantities from 'covar' must be positive.");
+				are.covar[j] = log(v);
+			}
+			else{
+				if(covar[j].func == "linear") are.covar[j] = v;
+				else emsg("n file '"+file+"' the functional relationship '"+covar[j].func+"' is not recognised.");
+			}
+		}
+		
+		vector <vector <double> > val;
+		val.resize(democat.size());
+		for(auto d = 0u; d < democat.size(); d++){
+			auto jmax = democat[d].value.size();
+			val[d].resize(jmax);
+			for(auto j = 0u; j < jmax; j++){
+				auto st = trow[democat_col[d][j]];
+				val[d][j] = atof(st.c_str());
+				if(std::isnan(val[d][j])) emsg("In file '"+file+"' the expression '"+st+"' is not a number");	
+			}
+		}
+		
+		for(auto d = 1u; d < democat.size(); d++){  // Normalises non-age categories 
+			auto sum = 0.0;
+			for(auto j = 0u; j < democat[d].value.size(); j++) sum += val[d][j];
+			for(auto j = 0u; j < democat[d].value.size(); j++) val[d][j] /= sum;
+		}
+
+		are.pop.resize(ndemocatpos);
+		for(auto dp = 0u; dp < ndemocatpos; dp++){
+			auto v = 0.0;
+			for(auto j = 0u; j < democat.size(); j++){
+				if(j == 0) v = val[j][democatpos[dp][j]];
+				else v *= val[j][democatpos[dp][j]];
+			}
+			are.pop[dp] = (unsigned int)(v+0.5);
+		}
+
+		area.push_back(are);			
+	}
+	
+	narea = area.size();
+
+	for(auto j = 0u; j < ncovar; j++){            // Shifts covariates so average is zero
+		auto sum = 0.0; for(auto c = 0u; c < narea; c++) sum += area[c].covar[j];
+		sum /= narea;
+	
+		for(auto c = 0u; c < narea; c++) area[c].covar[j] -= sum;
+	}		
+	
+	if(checkon == true){
+		for(const auto& are : area){
+			cout << are.code << are.x << " " <<  are.y << "  ***";
+			for(const auto& pop : are.pop) cout << pop << ", ";
+			cout << endl;	
+		}
+	}	
+}
+
+
+/// Potentially reduces the number of areas via a filter
+void Data::filter_areas(Table &tab)
+{
+	auto codecol = find_column(tab,"area"); 
+		
+	genQ.area_filter_ref.resize(tab.nrow);
+	if(filter == ""){
+		for(auto c = 0u; c < tab.nrow; c++) genQ.area_filter_ref[c] = c;
+	}
+	else{             // Generates a mapping between raw and filters so that M.txt can be loaded
+		auto narea_old = tab.nrow; 
+		vector <string> code_store(narea_old);
+		for(auto c = 0u; c < narea_old; c++){ 
+			code_store[c] = tab.ele[c][codecol]; 
+			genQ.area_filter_ref[c] = UNSET;
+		}
+	
+		filter_table(filter,tab); 
+		if(tab.nrow == 0) emsg("All areas have been filtered out");
+		
+		for(auto c = 0u; c < tab.nrow; c++){ 
+			auto cc = 0u; while(cc < narea_old && code_store[cc] != tab.ele[c][codecol]) cc++;
+			if(cc == narea_old) emsgEC("Data",65);
+			genQ.area_filter_ref[cc] = c;
+		}
+	}
+}
+
+
+/// Deletes rows from a table based on a filter
+void Data::filter_table(const string st, Table &tab) const
+{		
+	if(st.substr(0,8) == "northing" || st == "scotland" || st == "notscotland" || st == "england"){
+		if(st == "scotland" || st == "notscotland" || st == "england"){
+			if(st == "england"){
+				for(auto row = 0u; row < tab.nrow; row++){
+					if(tab.ele[row][0].substr(0,1) != "E") tab.ele[row][0] = "";
+				}
+			}
+			
+			if(st == "scotland"){
+				for(auto row = 0u; row < tab.nrow; row++){
+					if(tab.ele[row][0].substr(0,1) != "S") tab.ele[row][0] = "";
+				}
+			}
+			
+			if(st == "notscotland"){
+				for(auto row = 0u; row < tab.nrow; row++){
+					if(tab.ele[row][0].substr(0,1) == "S") tab.ele[row][0] = "";
+				}
+			}
+		}
+		else{
+			unsigned int num = atoi(st.substr(8,st.length()-8).c_str());
+		
+			Table tab2 = load_table("areadata.txt");
+			auto colno = find_column(tab2,"northing");
+		
+			vector <double> northing;
+			for(auto row = 0u; row < tab2.nrow; row++){
+				if(tab2.ele[row][0].substr(0,1) == "S") tab2.ele[row][colno] = to_string(-LARGE);
+				
+				northing.push_back(atof(tab2.ele[row][colno].c_str()));
+			}
+			
+			sort(northing.begin(),northing.end());
+			auto cut = (northing[northing.size()-num] + northing[northing.size()-num-1])/2;
+			
+			for(auto row = 0u; row < tab2.nrow; row++){
+				if(atof(tab2.ele[row][colno].c_str()) < cut) tab.ele[row][0] = "";
+			}
+		}
+		
+		remove_empty_rows(tab);
+		
+		if(false){ for(auto row = 0u; row < tab.nrow; row++) cout << tab.ele[row][0] << " keep" << endl;}
+	}
+	else emsg("filter prob");
+	
+	if(false){
+		for(auto r = 0u; r < tab.nrow; r++){
+			for(auto c = 0u; c < tab.ncol; c++){
+				cout << tab.ele[r][c] << " ";
+			}
+			cout << endl;
+		}
+	}
+}
+
+
+/// Removes any empty rows
+void Data::remove_empty_rows(Table& tab) const
+{
+	auto row = 0u;
+	while(row < tab.nrow){
+		if(tab.ele[row][0] != ""){
+			row++;
+		}
+		else{
+			tab.ele.erase(tab.ele.begin()+row);
+			tab.nrow--;
+		}
+	}
+}
+
+
+/// Loads datatables
+void Data::load_datatable(const Table &tabarea)
+{
+	bool sim;
+	if(details.mode == SIM) sim = true; else sim = false;     
+
+	for(auto i = 0u; i < datatable.size(); i++){        // Loads data tables for inference
+		switch(datatable[i].type){
+			case POP: case TRANS: load_timeseries_datatable(tabarea,i,sim); break;	
+			case MARGINAL: load_marginal_datatable(tabarea,i,sim); break;	
+		}
+	}
+	
+	nobs = obs.size();
+	if(false){ cout << nobs <<" Number of observations\n"; emsg("Number of observations");}
+}
+
+
+/// Loads a table giving time series data
+void Data::load_timeseries_datatable(const Table &tabarea, unsigned int i, bool sim)
+{
+	auto& dt = datatable[i];
+		
+	Observation ob;
+	ob.fraction_spline_ref = UNSET;
+	ob.w = UNSET;
+	ob.logdif_offset = UNSET;
+	ob.obsmodel = dt.obsmodel; ob.shape = dt.shape; ob.invT = dt.invT;
+	
+	ob.datatable = i;
+
+	auto file = dt.file; 
+	Table tab;
+	if(sim == false && dt.optype == DATA){
+		tab = load_table(file);
+		
+		table_select_dates(dt.start,dt.units,tab,"trans",dt.shift);
+	}
+	
+	auto datafilter = get_datafilter(tabarea,dt.geo,dt.democats);
+	
+	string filename, name, desc;
+	switch(dt.type){
+		case POP: desc = "Population"; break;
+		case TRANS: desc += "Transitions";  break;
+		case MARGINAL: emsgEC("Data",66); break;
+	}
+	filename += dt.observation;
+	name += dt.observation;
+	desc += " in "+dt.observation;
+	
+	if(dt.geo != "all"){
+		filename += "-"+dt.geo;
+		name += " "+dt.geo;
+		desc += " in "+dt.geo+": ";
+	}
+	if(dt.democats != "all"){
+		desc += " in "+dt.democats+": ";
+	}
+	
+	auto nrow = 0u;
+	if(dt.optype == DATA){
+		if(sim == false) nrow = tab.nrow;
+		else nrow = (unsigned int)((details.period - dt.start)/dt.units);
+	}
+	
+	auto flag = false;
+	for(const auto& df : datafilter){
+		auto col=0u;
+		if(sim == false && dt.optype == DATA){
+			for(col = 0; col < tab.ncol; col++) if(tab.heading[col] == df.name) break;
+			if(col == tab.ncol) col = UNSET;
+		}
+		
+		if(col != UNSET){
+			ob.dp_sel = df.dp_sel;
+			
+			flag = true;
+			
+			if(dt.optype == DATA && dt.start + (nrow-1)*dt.units > details.period){
+				emsg("The file '"+file+"' has more data than will fit in the defined 'start' and 'end' time period.");
+			}
+			
+			ob.area = df.area;
+			ob.graph = graph.size();
+			
+			Graph gr;
+			gr.type = GRAPH_TIMESERIES;
+			
+			gr.filename = filename;
+			gr.name = name;
+			gr.desc = desc;
+			if(df.name != "all"){
+				gr.filename += "-"+df.name;
+				gr.name += " "+df.name;
+				gr.desc += " "+df.name;
+			}
+			gr.colname = df.name;
+			gr.fraction_spline_ref = UNSET;
+			gr.datatable = i;
+			gr.dp_sel = ob.dp_sel;
+			gr.area = ob.area;
+			
+			switch(dt.type){
+				case POP: 				
+					for(auto row = 0u; row < nrow; row++){
+						int ti = (dt.start+row*dt.units)*details.division_per_time;
+						if(ti < 0 || ti > int(details.ndivision-1)) emsg("Data table '"+dt.file+"' is out of the inference time range");
+												
+						GraphPoint gp;
+						gp.xi = ti/details.division_per_time;
+						gp.xf = (ti+1)/details.division_per_time;
+						gp.obs.push_back(obs.size());
+						gr.point.push_back(gp);
+						
+						if(sim == true) ob.value = UNSET;
+						else ob.value = get_integer(tab.ele[row][col],file);
+						ob.sett_i = ti;
+						ob.sett_f = ti+1;
+					
+						obs.push_back(ob);
+					}
+				break;
+				
+				case TRANS:
+					{
+						auto val = 0u;
+						auto ti = dt.start;
+				
+						for(auto row = 0u; row < nrow; row++){
+							if(sim == true) val = UNSET;
+							else val += get_integer(tab.ele[row][col],file);
+											
+							GraphPoint gp;
+							unsigned int tf = (dt.start+(row+1)*dt.units)*details.division_per_time;
+
+							if(details.obs_combine_type == COMBINE_SECTION){
+								for(auto t = ti+1; t < tf; t++){
+									if(details.sec_define[t] == true) emsg("Observations cross particle filtering time points.");
+								}
+							}
+							
+							if(sim == true || row == nrow-1 || (details.obs_combine_type == COMBINE_VALUE && val >= VALUE_LIMIT) 
+					    //   || (details.obs_combine_type == COMBINE_SECTION && details.sec_define[tf] == true)){
+					      || (details.obs_combine_type == COMBINE_SECTION && (val >= VALUE_LIMIT || details.sec_define[tf] == true))){
+								gp.xi = ti/details.division_per_time;
+								gp.xf = tf/details.division_per_time;
+							
+								gp.obs.push_back(obs.size());
+								gr.point.push_back(gp);
+							
+								ob.sett_i = ti;
+								ob.sett_f = tf;
+								ob.value = val;
+							
+								obs.push_back(ob);
+								
+								val = 0;
+								ti = tf;
+							}
+						}
+					}
+					break;
+				
+				case MARGINAL:
+					emsgEC("Data",57);
+					break;
+			}
+			
+			dt.graph_ref.push_back(graph.size());
+			graph.push_back(gr);
+		}
+	} 
+	if(flag == false) emsg("The data in '"+file+"' was not used");
+}
+
+
+/// Based on expressions for geo and democats in the data file this generates information for all the data columns
+vector <DataFilter> Data::get_datafilter(const Table &tabarea, string geo, string democats)
+{ 
+	vector < vector<unsigned int> > dp_sel_list;    // Finds possible demographic possibilities                
+	vector <string> colname;
+
+	if(democats == "all"){
+		colname.push_back("all");
+		dp_sel_list.push_back(create_dp_sel("all"));
+	}
+	else{
+		auto dem = split(democats,',');
+		for(auto i = 0u; i < dem.size(); i++){
+			auto dsp = split(dem[i],':');
+			if(dsp.size() == 1){
+				auto dc = 0u; while(dc < democat.size() && democat[dc].name != dsp[0]) dc++;
+				if(dc == democat.size()) emsg("Cannot find '"+dsp[0]+"'");
+				
+				colname.clear();
+				for(const auto &val : democat[dc].value){
+					string st = "";
+					for(auto ii = 0u; ii < i; ii++){ if(st != "") st += ","; st += dem[i];}
+					if(st != "") st += ","; st += democat[dc].name+":"+val;
+					for(auto ii = i+1; ii < dem.size(); ii++){ if(st != "") st += ","; st += dem[i];}
+					
+					colname.push_back(val);
+					dp_sel_list.push_back(create_dp_sel(st));
+				}
+			}
+			else{
+				emsg("TO DO");
+			}
+		}
+		
+		if(dp_sel_list.size() == 0){
+			dp_sel_list.push_back(create_dp_sel(democats));
+		}
+	}
+		
+	vector < vector<unsigned int> > area_list; 
+	auto geosp = split(geo,':');
+	
+	auto geomap = create_geomap(tabarea,geosp[0]);
+		
+	switch(geosp.size()){
+		case 1:
+			if(geo != "all") colname.clear();
+			for(const auto &geom : geomap){
+				if(geo != "all") colname.push_back(geom.region);
+				area_list.push_back(geom.area);
+			}
+			break;
+
+		case 2:
+			{
+				auto areas = split(geosp[1],'|');
+				auto used = 0u;
+			
+				vector <unsigned int> area;
+				for(const auto &gm : geomap){
+					if(vector_contains(areas,gm.region) == true){
+						for(auto c : gm.area) area.push_back(c);
+						used++;
+					}
+				}
+				
+				if(used != areas.size()) emsg("'"+geosp[1]+"' are not all used");
+				area_list.push_back(area);
+			}
+			break;
+			
+		default: emsg("'"+geo+"' cannot be interpreted."); break;
+	}
+	
+	if(dp_sel_list.size() > 1 && area_list.size() > 1){
+		emsg("With '"+geo+"' and '"+democats+"' cannot have variation in both geograph and demographics");
+	}
+	
+	vector <DataFilter> datafilter;
+	
+	if(area_list.size() > 1){
+		for(auto i = 0u; i < area_list.size(); i++){
+			DataFilter df; 
+			df.name = colname[i];
+			df.area = area_list[i];
+			df.dp_sel = dp_sel_list[0];
+			datafilter.push_back(df);
+		}		
+	}
+	else{
+		for(auto i = 0u; i < dp_sel_list.size(); i++){
+			DataFilter df; 
+			df.name = colname[i];
+			df.area = area_list[0];
+			df.dp_sel = dp_sel_list[i];
+			datafilter.push_back(df);
+		}		
+	}
+	
+	if(false){
+		cout << "\n";
+		cout << "geo: " <<  geo << "   democats: " << democats << "\n";
+		for(auto  df : datafilter){
+			cout << df.name << "  Datafilter\n";
+			for(auto c : df.area) cout << area[c].code << ","; cout << " areas\n";
+			for(auto dp : df.dp_sel) cout << dp << ","; cout << " dp_sel\n";
+		}
+		emsg("P");
+	}
+
+	return datafilter;
+}
+
+
+// Loads up any regional effects
+void Data::load_region_effect(const Inputs &inputs, const Table& tab) 
+{
+	string geography;
+
+	inputs.regional_effects(geography,sigma);	
+	if(geography != ""){	
+		region_effect = create_geomap(tab,geography);
+		for(auto r = 0u; r < region_effect.size(); r++){
+			for(auto c : region_effect[r].area) area[c].region_effect = r;
+		}
+	}
+}
+	
+
+/// Loads a table giving marginal data
+void Data::load_marginal_datatable(const Table &tabarea, unsigned int i, bool sim)
+{
+	auto& dt = datatable[i];
+		
+	Observation ob;
+	ob.fraction_spline_ref = UNSET;
+	ob.datatable = i;
+	ob.w = UNSET;
+	ob.logdif_offset = UNSET;
+	ob.obsmodel = dt.obsmodel; ob.shape = dt.shape; ob.invT = dt.invT; 
+	ob.graph = graph.size();
+	
+	auto datafilter = get_datafilter(tabarea,dt.geo,dt.democats);
+
+	auto file = dt.file; 
+	Table tab;
+	if(sim == false){
+		tab = load_table(file);
+	}
+	
+	string filename = dt.observation, name = dt.observation, desc = dt.observation;
+
+	if(dt.geo != "all"){
+		filename += "-"+dt.geo;
+		name += " "+dt.geo;
+		desc += " in "+dt.geo;
+	}
+	if(dt.democats != "all"){
+		filename += "-"+dt.democats;
+		name += "-"+dt.democats;
+		desc += " in "+dt.democats;
+	}
+	
+	Graph gr;
+	gr.type = GRAPH_MARGINAL;
+	
+	gr.filename = filename;
+	gr.name = name;
+	gr.desc = desc;
+	
+	gr.colname = "";
+	gr.fraction_spline_ref = UNSET;
+	
+	auto flag = false;
+	auto row=0u;
+	for(const auto& df : datafilter){
+		if(sim == false){
+			for(row = 0; row < tab.nrow; row++) if(tab.ele[row][0] == df.name) break;
+			if(row == tab.nrow) row = UNSET;
+			else dt.demolist.push_back(df.name);
+		}
+		else{
+			dt.demolist.push_back(df.name);
+		}
+	
+		if(row != UNSET){
+			flag = true;
+			
+			ob.dp_sel = df.dp_sel;
+			ob.area = df.area;
+			
+			GraphPoint gp;
+			gp.xi = row;
+			gp.xf = row;
+			gp.obs.push_back(obs.size());
+			gr.point.push_back(gp);
+		
+			int ti = dt.start*details.division_per_time;
+			int tf = dt.end*details.division_per_time;
+		
+			if(ti < 0 || tf > int(details.ndivision)) emsg("Data table '"+dt.file+"' is out of the inference time range");
+			
+			ob.sett_i = ti;
+			ob.sett_f = tf;
+			
+			if(sim == true) ob.value = UNSET;
+			else ob.value = get_integer(tab.ele[row][1],file);
+						
+			obs.push_back(ob);
+		}
+		if(sim == true) row++;
+	}
+	if(flag == false) emsg("The data in '"+file+"' was not used");
+
+	dt.graph_ref.push_back(graph.size());
+	graph.push_back(gr);
+}
+
+
+/// Sets the offset and weight used for all the observations
+void Data::set_datatable_weights()
+{
+	vector <unsigned int> num_obs(datatable.size());
+	vector <double> value_max(datatable.size());
+
+	auto ngraph = 0u;
+	for(auto& ob : obs){ if(ob.graph > ngraph) ngraph = ob.graph;}
+	ngraph++;
+
+	vector <double> graph_value_max(ngraph);
+	for(auto gr = 0u; gr < ngraph; gr++){
+		graph_value_max[gr] = 0;
+	}
+		
+	for(auto dt = 0u; dt < datatable.size(); dt++){		
+		num_obs[dt] = 0;
+		value_max[dt] = 0;
+	}
+	
+	for(auto& ob : obs){		
+		auto dt = ob.datatable;
+		auto gr = ob.graph;
+		num_obs[dt]++;
+		auto val = ob.value;
+		if(val != UNKNOWN && val != THRESH){
+			if(val > value_max[dt]) value_max[dt] = val;
+			if(val > graph_value_max[gr]) graph_value_max[gr] = val;
+		}
+	}
+	
+	vector <double> graph_offset_store(ngraph);
+	for(auto gr = 0u; gr < ngraph; gr++) graph_offset_store[gr] = LARGE;
+	
+	auto frac = 0.8;
+	for(auto& ob : obs){		
+		auto dt = ob.datatable;
+		auto gr = ob.graph;
+		if(gr >= ngraph) emsgEC("data",56);
+		
+		ob.w = datatable[dt].weight/num_obs[dt];
+		
+		ob.logdif_offset = 0.05*(frac*graph_value_max[gr] + (1-frac)*value_max[dt]);
+		if(ob.logdif_offset < 3) ob.logdif_offset = 3;
+		
+		if(graph_offset_store[gr] == LARGE) graph_offset_store[gr] = ob.logdif_offset;
+		else{
+			if(graph_offset_store[gr] != ob.logdif_offset) emsg("offset");
+		}
+	}
+	
+	if(false){
+		for(auto gr = 0u; gr < graph.size(); gr++){
+			cout << graph[gr].name << " offset: " << graph_offset_store[gr] << "   graphmax:" << graph_value_max[gr] << "  tablemax:" << value_max[graph[gr].datatable] << endl;
+		}
+		emsg("done");
+	}
+}
+
+
+/// Creates all the demographic categories consistent with a string 
+vector <unsigned int> Data::create_dp_sel(string dp_str) const
+{
+	vector <unsigned int> dp_sel;
+
+	if(dp_str == "all"){			
+		for(auto dp = 0u; dp < ndemocatpos; dp++) dp_sel.push_back(dp);
+	}
+	else{
+		auto st = split(dp_str,',');
+		
+		vector <unsigned int> demo(ndemocat);
+		for(auto d = 0u; d < ndemocat; d++) demo[d] = UNSET;
+			
+		for(auto val : st){
+			auto valsp = split(val,':');
+			
+			if(valsp.size() != 2) emsg("'"+dp_str+"' must specify the demographic category and its value");
+			
+			auto d = 0u; while(d < ndemocat && democat[d].name != valsp[0]) d++;
+			if(d == ndemocat) emsg("Cannot find '"+valsp[0]+"' for the demographic selection");
+			
+			auto pos = 0u; while(pos < democat[d].value.size() && democat[d].value[pos] != valsp[1]) pos++;
+			if(pos == democat[d].value.size()) emsg("Cannot find '"+valsp[1]+"'");
+			
+			demo[d] = pos; 
+		}
+		
+		for(auto dp = 0u; dp < ndemocatpos; dp++){
+			auto d = 0u; while(d < ndemocat && (demo[d] == UNSET || demo[d] == democatpos[dp][d])) d++;
+			
+			if(d == ndemocat) dp_sel.push_back(dp);
+		}
+	}
+	
+	return dp_sel;
+}
+ 
+ 
+/// Based on a column in the area file a geogaphical mapping is created 
+vector <GeographicMap> Data::create_geomap(const Table &tab, string geo) const 
+{
+	vector <GeographicMap> geomap;
+	
+	if(geo == "all"){
+		GeographicMap geoadd;
+		geoadd.region = "all";
+		for(auto row = 0u; row < tab.nrow; row++) geoadd.area.push_back(row);
+		geomap.push_back(geoadd);	
+	}
+	else{
+		auto col = find_column(tab,geo);
+		for(auto row = 0u; row < tab.nrow; row++){
+			auto st = tab.ele[row][col];
+			if(st != "NA"){
+				auto g = 0u; while(g < geomap.size() && geomap[g].region != st) g++;
+				if(g < geomap.size()) geomap[g].area.push_back(row);
+				else{
+					GeographicMap geoadd;
+					geoadd.region = st;
+					geoadd.area.push_back(row);
+					geomap.push_back(geoadd);
+				}
+			}
+		}
+	}
+	
+	return geomap;
+}
+ 
+ 
 /// Gets a positive integer from a string
-unsigned int DATA::getint(const string& st, const string& file) const
+unsigned int Data::get_integer(const string& st, const string& file) const
 {
 	try {
-		return ::getint(st,threshold);
+		return ::get_integer(st,threshold);
 	} catch (const std::runtime_error& e) {
 		emsg("In file '"+file+"', "+e.what());
 	}
 }
 
-/// Loads a table from the data pipeline
-TABLE DATA::loadtablefromdatapipeline(string file) const
+
+/// Adds age columns together to get a new combined age column
+void Data::table_add_age(string name, unsigned int ti, unsigned int tf, Table &tab)
 {
-	TABLE tab;
-#ifdef USE_DATA_PIPELINE
+	vector <unsigned int> agecols;
+	
+	if(name == "all"){
+		for(auto col = 0u; col < tab.heading.size(); col++){
+			if(tab.heading[col] == "population"){
+				agecols.push_back(col); break;
+			}
+		}
+	}
+	
+	if(agecols.size() == 0){
+		for(auto col = 0u; col < tab.heading.size(); col++){
+			auto head = tab.heading[col];
+			if(head.length() > 3){
+				if(head.substr(0,3) == "age"){
+					unsigned int num = atoi(head.substr(3,head.length()-3).c_str());
+					if(num >= ti && num <= tf){
+						agecols.push_back(col);
+					}
+				}
+			}
+		}
+	}
+	
+	if(false){
+		cout << "Add " << agecols.size() << " age columns: ";
+		for(auto col : agecols) cout << tab.heading[col] << " ";
+		cout << "to generate " << name << endl;
+	}
+	
+	if(agecols.size() == 0) emsgroot("No age columns");
+	table_create_column(name,agecols,tab);
+}
+		
+		
+/// Loads a table from the data pipeline
+Table Data::load_table_from_datapipeline(string file) const
+{
+	Table tab;
+#ifdef USE_Data_PIPELINE
 	Table dptable = datapipeline->read_table(file,"default");
 
 	tab.file = filebasename(file);
 	tab.heading = dptable.get_column_names();
 	tab.ncol = tab.heading.size();
 	
-	vector<vector<string>> cols;
+	vector< vector <string> > cols;
 	
 	// Load each column as a string into cols
 	for (size_t j = 0; j < tab.ncol; j++) {
@@ -444,63 +1030,70 @@ TABLE DATA::loadtablefromdatapipeline(string file) const
 
 	cout << "Loaded table '" << file << "' from data pipeline" << endl;
 #else
-	emsg("loadtablefromdatapipeline for '"+file+"' cannot be called as data pipeline is not compiled in");
+	emsg("load_tablefromdatapipeline for '"+file+"' cannot be called as data pipeline is not compiled in");
 #endif
 
 	return tab;
 }
 
+
 /// Loads a table from a file
-TABLE DATA::loadtablefromfile(string file, string dir) const
+Table Data::load_table_from_file(string file, string dir, bool heading, char sep) const
 {
-	TABLE tab;
-	string line, st;
-	vector <string> vec;
 	ifstream in;
 
 	string used_file;
-	
 	if(dir != ""){
     used_file = dir+"/"+file;
 		in.open(used_file.c_str());
 		if(!in) emsg("Cannot open the file '"+dir+"/"+file+"'.");
 	}
 	else{
-    used_file = details.outputdir+"/"+file;
+    used_file = details.output_directory+"/Simulated_data/"+file;
 		in.open(used_file.c_str());
 		if(!in){
-      used_file = datadir+"/"+file;
+      used_file = data_directory+"/"+file;
 			in.open(used_file.c_str());
 			if(!in) emsg("Cannot open the file '"+used_file+"'");
 		}
 	}
 	
-	cout << "Loaded table " << file << " from file " << used_file << endl;
+	cout << "Loaded table " << file << "." << endl;
 
+	Table tab;
 	tab.file = file;
 	
-	getline(in,line);
+	string line;
+	if(heading == true){
+		getline(in,line);
 
-	stringstream ss(line);
+		stringstream ss(line);
+		do{
+			string st;
+			getline(ss,st,sep); st = strip(st);
+			tab.heading.push_back(st);
+			if(ss.eof()) break;
+		}while(true);
+		tab.ncol = tab.heading.size();
+	}
+	else tab.ncol = 0;
+		
 	do{
-		getline(ss,st,'\t'); st = strip(st);
-		tab.heading.push_back(st);
-		if(ss.eof()) break;
-	}while(true);
-	tab.ncol = tab.heading.size();
-	
-	do{
-		vec.clear();
+		vector <string> vec;
 		getline(in,line);
 		if(in.eof()) break;
 				
 		stringstream ss(line);
 		do{
-			getline(ss,st,'\t'); st = strip(st);
+			string st;
+			getline(ss,st,sep); st = strip(st);
 			vec.push_back(st);
 			if(ss.eof()) break;
 		}while(true);
-		if(vec.size() != tab.ncol) emsg("Rows in file '"+file+"' do not all share the same number of columns.");
+		if(tab.ncol == 0) tab.ncol = vec.size();
+		else{
+			if(vec.size() != tab.ncol) emsg("Rows in file '"+file+"' do not all share the same number of columns.");
+		}
 		
 		tab.ele.push_back(vec);
 	}while(true);
@@ -509,44 +1102,47 @@ TABLE DATA::loadtablefromfile(string file, string dir) const
 	return tab;
 }
 
+
 /// Loads a table from a file (if dir is specified then this directory is used
-TABLE DATA::loadtable(string file, string dir) const
+Table Data::load_table(string file, string dir, bool heading) const
 {
-	if (stringhasending(file, ".txt")) {
-		return loadtablefromfile(file, dir);
-	} else {
-		return loadtablefromdatapipeline(file);
+	if(stringhasending(file, ".txt")){ return load_table_from_file(file,dir,heading,'\t');} 
+	else {
+		if(stringhasending(file, ".csv")){ return load_table_from_file(file,dir,heading,',');} 
+		else return load_table_from_datapipeline(file);
 	}
 }
 
+
 /// Creates a new column by adding together existing columns		
-void DATA::table_createcol(string head,vector <unsigned int> cols, TABLE &tab) const
+void Data::table_create_column(string head, const vector <unsigned int> &cols, Table &tab) const
 {
-	unsigned int row, i, sum;
-	
 	tab.heading.push_back(head);
-	for(row = 0; row < tab.nrow; row++){
-		sum = 0; for(i = 0; i < cols.size(); i++) sum += atoi(tab.ele[row][cols[i]].c_str());
+	for(auto& trow : tab.ele){
+		auto sum = 0u; for(auto i = 0u; i < cols.size(); i++) sum += atoi(trow[cols[i]].c_str());
 		stringstream ss; ss << sum;
-		tab.ele[row].push_back(ss.str());
+		trow.push_back(ss.str());
 	}
 	tab.ncol++;
 }
 
-/// Selects dates as specified in the TOLM file
-void DATA::table_selectdates(unsigned int t, unsigned int units, TABLE &tab, string type) const 
+
+/// Selects dates as specified in the TOML file
+void Data::table_select_dates(unsigned int t, unsigned int units, Table &tab, string type, unsigned int shift) const 
 {
-	unsigned int row, tt, num1, num2, i;
-	
-	row = 0;
+	auto row = 0u;
 	while(row < tab.nrow){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
+		auto tt = details.gettime(tab.ele[row][0]) + shift - details.start;
+		tab.ele[row][0] = details.getdate(tt);
+		
 		if(tt < t){
 			if(type == "trans" && row > 0){ // In the case of transitions adds up the contributions from other days to make a week 
-				for(i = 1; i < tab.ncol; i++){
-					num1 = getint(tab.ele[row-1][i],tab.file);
-					num2 = getint(tab.ele[row][i],tab.file);
-					if(num1 == THRESH || num2 == THRESH || num1 == UNKNOWN || num2 == UNKNOWN) emsg("In the file '"+tab.file+"', amalgamation of data with unknown values is not possible.");
+				for(auto i = 1u; i < tab.ncol; i++){
+					auto num1 = get_integer(tab.ele[row-1][i],tab.file);
+					auto num2 = get_integer(tab.ele[row][i],tab.file);
+					if(num1 == THRESH || num2 == THRESH || num1 == UNKNOWN || num2 == UNKNOWN){
+						emsg("In the file '"+tab.file+"', amalgamation of data with unknown values is not possible.");
+					}
 					tab.ele[row-1][i] = to_string(num1+num2);
 				}				
 			}
@@ -562,482 +1158,313 @@ void DATA::table_selectdates(unsigned int t, unsigned int units, TABLE &tab, str
 	if(tab.nrow == 0) emsg("The file '"+tab.file+"' does not contain any information.");
 	
 	if(type=="trans"){                         // Removes the last line if incomplete
-		if(details.gettime(tab.ele[tab.nrow-1][0]) > details.end-units){
+		while(details.gettime(tab.ele[tab.nrow-1][0]) + shift > details.end-units){
 			tab.ele.erase(tab.ele.begin()+tab.nrow-1);
 			tab.nrow--;
 		}
 	}	
 	
-	if(checkon == 1){
-		for(row = 0; row < tab.nrow; row++){
-			for(i = 0; i < tab.ncol; i++) cout << tab.ele[row][i] << " ";
-			cout << endl;
+	if(checkon == true){
+		for(const auto& trow : tab.ele){
+			for(const auto& ele : trow) cout << ele << " ";
+			cout << "TABLE" << endl;
 		}
 	}
 }				
 
+
 /// Finds a column in a table
-unsigned int DATA::findcol(const TABLE &tab, string name) const
+unsigned int Data::find_column(const Table &tab, string name) const
 {
 	unsigned int c;
-	
 	for(c = 0; c < tab.ncol; c++) if(tab.heading[c] == name) break;
 	if(c == tab.ncol) emsg("Cannot find the column heading '"+name+"' in file '"+tab.file+"'.");
 	return c;
 }		
 			
-/// Copies data from core zero to all the others
-void DATA::copydata(unsigned int core)
-{
-	unsigned int td, pd, md, k, kmax, v, vmin, vmax, num;
-	size_t si;
 
-	if(core == 0){                                  				   // Copies the above information to all the other cores
-		packinit(0);
-		pack(nregion);
-		pack(region);
-		pack(narea);
-		pack(area);
-		for(td = 0; td < transdata.size(); td++){
-			pack(transdata[td].num);
-			pack(transdata[td].rows);
-		}
-		for(pd = 0; pd < popdata.size(); pd++){
-			pack(popdata[pd].num);
-			pack(popdata[pd].rows);
-		}
-		for(md = 0; md < margdata.size(); md++){
-			pack(margdata[md].percent);
-		}
-		kmax = genQ.Qten.size();
-		pack(kmax);
-		for(k = 0; k < kmax; k++){
-			pack(genQ.Qten[k].name);
-		}
-		si = packsize();
+/// Coarse grains the areas to a rougher geography
+void Data::coarse_grain(const Table &tab, string coarse)
+{		
+	if(coarse == "UNSET") return;
+	
+	vector <double> pop_c(narea);
+	auto pop_total = 0.0;
+	for(auto c = 0u; c < narea; c++){
+		pop_c[c] = 0; for(auto p : area[c].pop) pop_c[c] += p;
+		pop_total += pop_c[c];
 	}
-
-	MPI_Bcast(&si,1,MPI_UNSIGNED,0,MPI_COMM_WORLD);
-	if(core != 0){
-		packinit(si);
-	}
-	MPI_Bcast(packbuffer(),si,MPI_DOUBLE,0,MPI_COMM_WORLD);
-
-	if(core != 0){
-		unpack(nregion);
-		unpack(region);
-		unpack(narea);
-		unpack(area);
-		for(td = 0; td < transdata.size(); td++){
-			unpack(transdata[td].num);
-			unpack(transdata[td].rows);
+	
+	auto geomap = create_geomap(tab,coarse);
+	vector <Area> areanew;
+	vector <unsigned int> areaold_ref(narea);
+	
+	for(auto cnew = 0u; cnew < geomap.size(); cnew++){
+		Area are;
+		are.code = geomap[cnew].region; 
+		are.region_effect = UNSET;
+		
+		are.x = 0; are.y = 0;
+		auto sum = 0.0;
+		for(auto c : geomap[cnew].area){
+			areaold_ref[c] = cnew;
+			 
+			are.x += area[c].x*pop_c[c];
+			are.y += area[c].y*pop_c[c];
+			sum += pop_c[c];
 		}
-		for(pd = 0; pd < popdata.size(); pd++){
-			unpack(popdata[pd].num);
-			unpack(popdata[pd].rows);
-		}
-		for(md = 0; md < margdata.size(); md++){
-			unpack(margdata[md].percent);
-		}
-		unpack(kmax);
-		genQ.Qten.resize(kmax);
-		for(k = 0; k < kmax; k++){
-			unpack(genQ.Qten[k].name);
-		}
-		if(si != packsize()) emsgEC("Data",1);
-	}
-
-	for(k = 0; k < genQ.Qten.size(); k++){                                                   // Copies the Q matrices
-		num = narea*nage;
-		MPI_Bcast(&num,1,MPI_UNSIGNED,0,MPI_COMM_WORLD);
-		if(core != 0){
-			genQ.Qten[k].ntof.resize(num);
-			genQ.Qten[k].tof.resize(num);
-			genQ.Qten[k].valf.resize(num);
+		are.x /= sum; are.y /= sum;
+		
+		are.pop.resize(ndemocatpos);
+		for(auto dp = 0u; dp < ndemocatpos; dp++){
+			are.pop[dp] = 0; for(auto c : geomap[cnew].area) are.pop[dp] += area[c].pop[dp]; 
 		}
 		
-		vmin = 0;
-		do{
-			vmax = vmin+1000; if(vmax > num) vmax = num;
-			
-			if(core == 0){
-				packinit(0);
-				for(v = vmin; v < vmax; v++){
-					pack(genQ.Qten[k].ntof[v]);
-					pack(genQ.Qten[k].tof[v]);
-					pack(genQ.Qten[k].valf[v]);
-				}
-				si = packsize();
+		are.covar.resize(ncovar);
+		for(auto co = 0u; co < ncovar; co++){
+			are.covar[co] = 0;
+			auto sum = 0.0;
+			for(auto c : geomap[cnew].area){
+				are.covar[co] += area[c].covar[co]*pop_c[c];
+				sum += pop_c[c];
 			}
-
-			MPI_Bcast(&si,1,MPI_UNSIGNED,0,MPI_COMM_WORLD);
-			if(core != 0){
-				packinit(si);
-			}
-			MPI_Bcast(packbuffer(),si,MPI_DOUBLE,0,MPI_COMM_WORLD);
-
-			if(core != 0){
-				for(v = vmin; v < vmax; v++){
-					unpack(genQ.Qten[k].ntof[v]);
-					unpack(genQ.Qten[k].tof[v]);
-					unpack(genQ.Qten[k].valf[v]);
-				}
-				if(si != packsize()) emsgEC("Data",2);
-			}
+			are.covar[co] /= sum;
+		}
+		
+		areanew.push_back(are);
+	}
+	auto areaold = area;
 	
-			vmin = vmax;
-		}while(vmin < num);
+	if(false){
+		for(auto v: area) cout <<v.code << " codes before coarse graining\n";
+	}
+	
+	area = areanew;
+	narea = area.size();
+	
+	if(false){
+		for(auto v: area) cout << v.code << " codes after coarse graining\n";
+	}
+	
+	vector <double> pop_cnew(narea);
+	auto pop_totalnew = 0.0;
+	for(auto c = 0u; c < narea; c++){
+		pop_cnew[c] = 0; for(auto p : area[c].pop) pop_cnew[c] += p;
+		pop_totalnew += pop_cnew[c];
+	}
+	
+	SparseMatrix M;                      // Recalibrates matrix of interactions
+	M.N = narea;
+	M.diag.resize(narea);
+	M.to.resize(narea);
+	M.val.resize(narea);
+	
+	for(auto c = 0u; c < narea; c++) M.diag[c] = 0;
+	
+	for(auto cold = 0u; cold < areaold.size(); cold++){
+		auto c = areaold_ref[cold];
+		M.diag[c] += genQ.M.diag[c]*pop_c[c]*pop_c[c];
+		
+		for(auto i = 0u; i < genQ.M.to[cold].size(); i++){
+			auto coldto = genQ.M.to[cold][i];
+			auto val = genQ.M.val[cold][i];
+			
+			auto cto = areaold_ref[coldto];
+			if(cto == c){
+				M.diag[c] += val*pop_c[c]*pop_c[c]; 
+			}
+			else{
+				auto j = 0u; while(j < M.to[c].size() && M.to[c][j] != cto) j++;
+				if(j == M.to[c].size()){
+					M.to[c].push_back(cto);
+					M.val[c].push_back(val*pop_c[c]*pop_c[cto]);
+				}
+				else{
+					M.val[c][j] += val*pop_c[c]*pop_c[cto];
+				}
+			}
+		}
+	}
+	
+	for(auto c = 0u; c < narea; c++){
+		M.diag[c] /= (pop_cnew[c]*pop_cnew[c]);
+		for(auto j = 0u; j < M.to[c].size(); j++) M.val[c][j] /= (pop_cnew[c]*pop_cnew[M.to[c][j]]);
+	}
+
+	genQ.M = M;
+	
+	geo_normalise(genQ.M);
+ 
+ 	if(false){
+		//for(auto c = 0u; c < areaold_ref.size(); c++) cout << c << " " << areaold_ref[c] << " arearef\n";
+		
+		for(auto c = 0u; c < narea; c++){
+			cout << c << " diag " << genQ.M.diag[c] << ": ";
+			for(auto j = 0u; j < genQ.M.to[c].size(); j++){
+				cout << genQ.M.to[c][j] << " " << genQ.M.val[c][j] << ", ";
+			}
+			cout << "M\n";
+		}
+		emsg("do");
+	}
+	
+	
+	for(auto& ob : obs)	ob.area = convert_areas("observation",ob.area,geomap);                 // Recalibrates observations
+	 cout << "beg\n";
+	for(auto& gr : graph){
+		//for(auto c: gr.area) cout << areaold[c].code << ", "; cout << "code\n";
+		gr.area = convert_areas("graph",gr.area,geomap);                     // Recalibrates graphs
+	}
+	 cout << "end\n";
+	for(auto& re : region_effect) re.area = convert_areas("region effect",re.area,geomap);     // Recalibrates regional effects
+
+	for(auto r = 0u; r < region_effect.size(); r++){
+		for(auto c : region_effect[r].area) area[c].region_effect = r;
+	}
+	
+	if(false) print_obs();
+	
+	if(checkon == true){
+		for(const auto& are : area){
+			cout << are.code << are.x << " " <<  are.y << "  ***";
+			for(const auto& pop : are.pop) cout << pop << ", ";
+			cout << endl;	
+		}
 	}	
 }
 
-string DATA::strip(string line) const 
+
+/// Determines if a vector contains a given element
+bool Data::vector_contains(const vector <unsigned int> &vec, unsigned int num) const
 {
-	unsigned int len;
-	
-	len = line.length();
-	if(len > 0 && line.substr(len-1,1) == "\r") line = line.substr(0,len-1);
-	len = line.length();
-	if(len > 0 && line.substr(0,1) == "\"") line = line.substr(1,len-1);
-	len = line.length();
-	if(len > 0 && line.substr(len-1,1) == "\"") line = line.substr(0,len-1);
-	
-	return line;
+	if(find(vec.begin(),vec.end(),num) != vec.end()) return true;
+	return false;
 }	
 
-void DATA::sortX(vector <unsigned int> &vec){ sort(vec.begin(),vec.end(),compX);}
-void DATA::sortY(vector <unsigned int> &vec){ sort(vec.begin(),vec.end(),compY);}
 
-
-/************ Code below this is used for diagnostic purposes and will not be in the final version ***********/
-
-/// This is used to plot raw data files (this is used for diagnoistic purposed, and not in the analysis)
-void DATA::plotrawdata()
+/// Determines if a string vector contains a given element
+bool Data::vector_contains(const vector <string> &vec, string num) const
 {
-	unsigned int row, tt, num, sum, pd, r, t;	
-	vector <unsigned int> numst, numst2;
-	unsigned tmax = 140, j;
-	double dt, mean_ns, sd_ns, sd, mean;
-	
-	TABLE tab;
-	vector <int> dif, Hnum, adm;
-	
-	for(t = 0; t < tmax; t++){
-		Hnum.push_back(0);
-		adm.push_back(0);
-	}
-	
-	tab = loadtable("DailyDeathsConfirmedCovid.txt");
-	ofstream dout(details.outputdir+"/deathraw.txt");
-	sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN) dout << tt << " " << num << endl;
-		if(num != UNKNOWN) sum += num;
-	}
-	cout << sum << " Deaths" << endl;
-	
-	tab = loadtable("hospital_admissions_number_per_day.txt");
-	ofstream dout2(details.outputdir+"/hospadminraw.txt");
-	sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN) sum += num;
-		if(num != UNKNOWN) dout2 << tt << " " << num << " " << sum << endl;
-		if(num == UNKNOWN) num = 0;
-		adm[tt] = num;
-	}
-	cout << sum << " Admissions" << endl;
-		
+	if(find(vec.begin(),vec.end(),num) != vec.end()) return true;
+	return false;
+}	
 
-	tab = loadtable("NHS_and_UKG_national_daily_confirmed_cases.txt");
-	ofstream dout3(details.outputdir+"/nhsothercasesraw.txt");
-	sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN) dout3 << tt << " " << num << endl;
-		if(num != UNKNOWN) sum += num;
-	}
-	cout << sum << " NHS+other cases" << endl;
-	
-	ofstream poptot(details.outputdir+"/Htot.txt");
 
-	pd = 0;
-	for(row = 0; row < popdata[pd].rows; row++){
-		sum = 0;
-		for(r = 0; r < region.size(); r++){
-			num = popdata[pd].num[r][row];
+/// Removes an element from a vector
+void Data::vector_remove(vector <unsigned int> &vec, unsigned int num) const
+{
+	auto i = find(vec.begin(),vec.end(),num);
+	if(i == vec.end()) emsgEC("Data",101);
+	vec.erase(i);
+}	
 
-			if(num == UNKNOWN) num = 0;
-			if(num == THRESH) num = 0;
-			sum += num;	
+
+/// Converts a set of areas to a new set provides by a geographical map
+vector <unsigned int> Data::convert_areas(string type, vector <unsigned int> &vec, const vector <GeographicMap> &map) const
+{
+	vector <unsigned int> vec_new;
+	for(auto cnew = 0u; cnew < map.size(); cnew++){
+		auto i = 0u; while(i < map[cnew].area.size() && vector_contains(vec,map[cnew].area[i]) == true) i++;
+		if(i == map[cnew].area.size()){
+			vec_new.push_back(cnew);
+			for(auto c: map[cnew].area) vector_remove(vec,c); 
 		}
-		Hnum[popdata[pd].start + row*popdata[pd].units] = sum;
+	}	
 
-		poptot << popdata[pd].start + row*popdata[pd].units << " "<< sum<< endl;
-	}
+	if(vec.size() != 0) emsg("Cannot course grain "+type);
 	
-	ofstream recrate(details.outputdir+"/recrate.txt");
-	for(t = 54; t < 134; t++){
-		recrate << t << " " << " " << Hnum[t] << " " << adm[t] << " " << adm[t] - ( Hnum[t+1] - Hnum[t]) << "\n";
-	}
-	
-	tab = loadtable("NHS_only_national_daily_confirmed_cases.txt");
-	ofstream dout4(details.outputdir+"/nhsonlycasesraw.txt");
-	sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN) dout4 << tt << " " << num << endl;
-		if(num != UNKNOWN) sum += num;
-	}
-	cout << sum << " NHS cases" << endl;
-	
-	tab = loadtable("HD_NRS.txt");
-	ofstream dout5(details.outputdir+"/HDraw.txt");
-	sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN) dout5 << tt << " " <<  double(num)/7 << endl;
-		if(num != UNKNOWN) sum += num;
-	}
-	cout << sum << "HD Deaths" << endl;
-	
-	tab = loadtable("ID_NRS.txt");
-	ofstream dout6(details.outputdir+"/IDraw.txt");
-	sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		tt = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN) dout6 << tt << " " << double(num)/7 << endl;
-		if(num != UNKNOWN) sum += num;
-	}
-	cout << sum << "HI Deaths" << endl;
-	
-	
-	// estimate distribution
+	return vec_new;
+}
 
-	numst.resize(tmax); numst2.resize(tmax);
-	for(t = 0; t < tmax; t++){ numst[t] = 0, numst[t] = 0;}
-	
-	tab = loadtable("hospital_admissions_number_per_day.txt");
-	//sum = 0;
-	for(row = 0; row < tab.nrow; row++){
-		t = details.gettime(tab.ele[row][0]) - details.start;
-		num = getint(tab.ele[row][1],"");
-		if(num != UNKNOWN){
-			for(j = 0; j < num; j++){
-				mean_ns = 20; sd_ns = 20;
-				sd = sqrt(log((1+sd_ns*sd_ns/(mean_ns*mean_ns)))); mean = log(mean_ns) - sd*sd/2;
-				dt = exp(normal(mean,sd));
-				tt = int(t + dt+ran());
-				if(tt < tmax) numst[tt]++;
-				tt = int(dt+ran());
-				if(tt < tmax) numst2[tt]++;
-			}
+
+/// Loads up counterfactual information  
+void Data::load_counterfactual(const Inputs &inputs, const Table &tabarea)  
+{
+	if(details.mode == COUNTER){
+		inputs.find_counterfact(details,counterfact);
+		for(auto &cf : counterfact){
+			cf.dp_sel = create_dp_sel(cf.democats);
+			
+			auto geosp = split(cf.geo,':');
+			auto geomap = create_geomap(tabarea,geosp[0]);
+			if(geosp.size() == 2) emsg("This is not implemented yet");
+			if(geomap.size() != 1) emsg("This is not implemented yet");
+			cf.area = geomap[0].area;
 		}
 	}
 	
-	ofstream deathpred(details.outputdir+"/deathpred.txt");
-	for(t = 0; t < tmax; t++){
-		deathpred << t << " " << numst[t] <<  " " << numst2[t] << endl;
+	if(details.mode == PPC){
+		inputs.find_ppc_start(details,counterfact);
 	}
 }
-	
-/// This is used to plot raw data files (this is used for diagnoistic purposed, and not in the analysis)
-void DATA::generatedeathdata()
-{
-	unsigned int row, t, nweek = 40, w, ww, r, n, sum, sumH, sumI;
-	vector< vector <unsigned int> > num;
-	vector <unsigned int> HDnum;
-	vector <unsigned int> IDnum;
-	vector <string> linedate;
-	TABLE tab;
-	string reg, date, file, sex, age, cause, loc;
-	
-	tab = loadtable("deathdata.txt");
-	
-	num.resize(nweek); linedate.resize(nweek); HDnum.resize(nweek); IDnum.resize(nweek);
-	for(w = 0; w < nweek; w++){
-		HDnum[w] = 0; IDnum[w] = 0;
-				 
-		num[w].resize(region.size());
-		for(r = 0; r < region.size(); r++) num[w][r] = 0;
-	}
 
-	sum = 0; sumI = 0; sumH = 0;
-	for(row = 0; row < tab.nrow; row++){
-		reg = tab.ele[row][0];
-		date = tab.ele[row][1];
-		n = getint(tab.ele[row][4],"");
-		sex = tab.ele[row][5];
-		age = tab.ele[row][6];
-		cause = tab.ele[row][7];
-		loc = tab.ele[row][8];
-		
-		if(date.substr(0,4) == "w/c "){
-			date = date.substr(4,date.length()-4);
-			t = details.gettime(date);
-			if(t >=details.start){
-				w = (t-details.start)/7; if(w > nweek) emsg("out");
-						
-				if(sex == "All" && age == "All" && cause == "COVID-19 related"){
-					r = 0; while(r < region.size() && region[r].code != reg) r++;
-					if(r < region.size()){
-						if(loc == "All"){				
-							linedate[w] = date;
-							num[w][r] += n;
-							sum += n;
-						}
-					}
-					else{
-						if(reg == "S92000003" && loc != "All"){
-							if(loc == "Hospital"){ HDnum[w] += n; sumH += n;}
-							else{ IDnum[w] += n; sumI += n;}
-						}
-					}
+
+/// Outputs properties of data to the terminal
+string Data::print() const
+{
+	stringstream ss;
+	ss << endl;
+	
+	ss << "Age categories: " << endl << "  ";
+	for(auto j = 0u; j < democat[0].value.size(); j++){
+		if(j != 0) ss << " | ";
+		ss << democat[0].value[j];
+		if(democat[0].sus_vari == true){
+			ss << " sus='" << democat[0].ps[j].name << "'";
+			ss << " value='" << democat[0].ps[j].value << "'";
+			ss << " prior='" << democat[0].ps[j].prior << "'";
+		}
+	}
+	ss << endl << endl;
+
+	if(covar.size() > 0){
+		ss << "Area covariates: " << endl;
+		ss << "  ";
+		for(const auto& cov : covar){
+			ss << cov.name;
+			ss << "   param='" << cov.ps.name << "'";
+			if(cov.ps.value != "") ss << "   value='" << cov.ps.value << "'"; 
+			if(cov.ps.prior != "") ss << "   prior='" << cov.ps.prior << "'";
+			ss << endl;
+		}
+		ss << endl;
+	}	
+	
+	if(democat.size() > 1){
+		ss << "Demographic categories: " << endl;
+		for(auto k = 1u; k < democat.size(); k++){
+			ss << "  ";
+			for(auto j = 0u; j < democat[k].value.size(); j++){
+				if(j != 0) ss << ", ";
+				ss << democat[k].value[j];
+				if(democat[k].sus_vari == true){
+					ss << " sus='" << democat[k].ps[j].name << "'";
+					if(democat[k].ps[j].value != "") ss << " value='" << democat[k].ps[j].value << "'";
+					if(democat[k].ps[j].prior != "") ss << " prior='" << democat[k].ps[j].prior << "'";
 				}
-			}
+			}	
+			ss << endl;
 		}
-	}
-	cout << "Total in regions: " << sum << endl;
-	cout << "Total from hospitals: " << sumH << endl;
-	cout << "Total from community: " << sumI << endl;
-
-	file = details.outputdir+"/D_NRS_reg.txt";
-	ofstream deathout(file.c_str());
-	deathout << "date"; for(r = 0; r < region.size(); r++) deathout << "\t" << region[r].code;
-	deathout << endl;
-	for(w = 0; w < nweek; w++){
-		deathout << linedate[w];
-		for(r = 0; r < region.size(); r++){
-			sum = 0; for(ww = 0; ww < w; ww++) sum += num[ww][r];
-			deathout  << "\t" << sum;
-		}
-		deathout << endl;
+		ss << endl;
 	}
 	
-	file = details.outputdir+"/HD_NRS.txt";
-	ofstream HDout(file.c_str());
-	HDout << "date\tall" << endl;
-	for(w = 0; w < nweek; w++){
-		HDout << linedate[w] << "\t" << HDnum[w] << endl;
-	}
-
-	file = details.outputdir+"/ID_NRS.txt";
-	ofstream IDout(file.c_str());
-	IDout << "date\tall" << endl;
-	for(w = 0; w < nweek; w++){
-		IDout << linedate[w] << "\t" << IDnum[w] << endl;
-	}
+	return ss.str();
 }
 
-/// Generates the M matrix for OAs
-void DATA::convertOAtoM()
+
+/// Prints all the observations made
+void Data::print_obs() const
 {
-	unsigned int row, num, j0, j1, a, n=0;
-	double r, dx, dy, rr;
-	
-	string a0, a1;
-	vector < vector <float> > numcont;
-	
-	TABLE tab;
-	
-	numcont.resize(area.size());
-	for(j0 = 0; j0 < area.size(); j0++){
-		numcont[j0].resize(area.size());
-		for(j1 = 0; j1 < area.size(); j1++){
-			numcont[j0][j1] = 0;
-		}
-	}
-	
-	if(true){    // A powerlaw spatial kernel
-		double xmin, xmax;
-		xmin = large; xmax = -large;
-		for(a = 0; a < area.size(); a++){
-			if(area[a].x < xmin) xmin = area[a].x; 
-			if(area[a].x > xmax) xmax = area[a].x;
-			if(area[a].x < xmin) xmin = area[a].x; 
-			if(area[a].x > xmax) xmax = area[a].x;
-		}
-		r = (xmax-xmin)/100;
-		
-		for(j0 = 0; j0 < area.size(); j0++){
-			cout << j0 << " " << area.size() << "\n";
-			for(j1 = 0; j1 < area.size(); j1++){
-				dx = area[j0].x - area[j1].x;
-				dy = area[j0].y - area[j1].y;
-				rr = sqrt(dx*dx+dy*dy);
-				if(rr < 0.5*r){
-					numcont[j0][j1] = 1.0/(1+rr*rr/(r*r));
-				}
-			}
-		}
-	}
-	else{
-		tab = loadtable("direct.txt");
-		for(row = 0; row < tab.nrow; row++){
-			cout << row << " / " << tab.nrow << "\n";
-			stringstream ss(tab.ele[row][0]);
-			ss >> a0 >> a1 >> num;
-			a0 = strip(a0); a1 = strip(a1); 
-			
-			j0 = 0; while(j0 < area.size() && area[j0].code != a0) j0++;
-			if(j0 == area.size()) cout << "cannot find\n";
-			
-			j1 = 0; while(j1 < area.size() && area[j1].code != a1) j1++;
-			if(j1 == area.size()) cout << "cannot find\n";
-			
-			numcont[j0][j1] += num;
-			if(j0 != j1) numcont[j1][j0] += num;
-		}
-	}
-	
-	ofstream Mout((datadir+"/Mdata.txt").c_str());
-	Mout.precision(4);
-	Mout << "oa1	oa2	contact" << endl;
-	for(j0 = 0; j0 < area.size(); j0++){
-		for(j1 = j0; j1 < area.size(); j1++){
-			if(numcont[j0][j1] != 0){
-				Mout << j0 << "\t" << j1 << "\t" << numcont[j0][j1] << endl;
-				n++;
-			}
-		}
-	}
-	cout << double(n)/(area.size()*area.size()) << "Sparcity\n";
-}
-
-/// Generates the M matrix for Regional model
-void DATA::convertRegion_M()
-{
-	const unsigned int L = 171;
-	unsigned int i, j; 
-	vector <vector <double> > m;
-	string file;
-
-	file = datadir+"/contact matrix regional-2.txt";
-	ifstream matrix(file);
-	m.resize(L);
-	for(j = 0; j < L; j++){
-		m[j].resize(L);
-		for(i = 0; i < L; i++){
-			matrix >> m[j][i];
-		}
-	}
-	
-	file = datadir+"/Mdata.txt";
-	ofstream Mout(file.c_str());
-
-	Mout << "area1	area2	contact" << endl;	
-	for(i = 0; i < area.size(); i++){
-		for(j = i; j < area.size(); j++){
-			if(m[j][i] != 0){
-				Mout << i << "\t" << j << "\t" << m[j][i] << endl;
-			}
-		}	
+	for(auto& ob : obs){
+		cout << "Datatable: " << ob.datatable << "  ";
+		cout << "Graph: " << ob.graph << "  ";
+		cout << "Value: " << ob.value << "  ";
+		cout << "ti: " << ob.sett_i << "  ";
+		cout << "tf: " << ob.sett_f << "  ";
+		cout << "offset: " << ob.logdif_offset << "  ";
+		cout << "w: " << ob.w << "  ";
+		cout << "area: "; for(auto c : ob.area) cout <<c << ",  ";
+		cout << "dp_sel: "; for(auto dp : ob.dp_sel) cout << dp << ",  ";
+		cout << "\n\n";
 	}
 }
-
