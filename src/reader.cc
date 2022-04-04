@@ -14,7 +14,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 #endif
 
-#include "../toml11/toml.hpp"
+#include "toml.hpp"
 
 // Re-enable warnings
 #if defined(__GNUC__) && __GNUC__ < 5
