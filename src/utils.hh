@@ -13,6 +13,7 @@
 #include <vector>
 //#include <bits/stdc++.h>
 #include <cmath>
+#include <algorithm>
 
 using namespace std;
 
