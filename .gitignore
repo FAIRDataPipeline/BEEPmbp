@@ -7,3 +7,4 @@ gitversion.hh
 /run
 /build
 /regression_test_results
+/Output*/
